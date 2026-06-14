@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from urllib.parse import unquote
+import asyncio
 import hashlib
 import secrets
 import time
@@ -378,7 +379,7 @@ async def root():
     login_path = os.path.join(static_dir, 'login.html')
     if os.path.exists(login_path):
         with open(login_path, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(f.read(), headers={"Cache-Control": "no-store"})
     else:
         return HTMLResponse('<h3>Login page not found</h3>')
 
@@ -389,7 +390,7 @@ async def login_page():
     login_path = os.path.join(static_dir, 'login.html')
     if os.path.exists(login_path):
         with open(login_path, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(f.read(), headers={"Cache-Control": "no-store"})
     else:
         return HTMLResponse('<h3>Login page not found</h3>')
 
@@ -412,7 +413,7 @@ async def admin_page():
     if not os.path.exists(index_path):
         return HTMLResponse('<h3>No front-end found</h3>')
     with open(index_path, 'r', encoding='utf-8') as f:
-        return HTMLResponse(f.read())
+        return HTMLResponse(f.read(), headers={"Cache-Control": "no-store"})
 
 
 # 用户管理页面路由
@@ -850,6 +851,65 @@ class CookieStatusIn(BaseModel):
     enabled: bool
 
 
+async def test_xianyu_cookie_connection(cookie_id: str, cookie_value: str) -> Dict[str, Any]:
+    """Check local cookie shape without actively probing Xianyu token APIs."""
+    checked_at = int(time.time())
+    try:
+        cookies = trans_cookies(cookie_value)
+        unb = cookies.get('unb')
+        if not unb:
+            return {
+                'cookie_id': cookie_id,
+                'valid': False,
+                'status': 'invalid',
+                'message': "Cookie缺少unb字段",
+                'checked_at': checked_at,
+            }
+
+        if not cookies.get('_m_h5_tk'):
+            return {
+                'cookie_id': cookie_id,
+                'valid': False,
+                'status': 'error',
+                'message': 'Cookie格式不完整，缺少_m_h5_tk，无法确认账号连接',
+                'checked_at': checked_at,
+            }
+
+        return {
+            'cookie_id': cookie_id,
+            'valid': False,
+            'status': 'error',
+            'message': 'Cookie格式完整，但当前未检测到在线连接；为避免触发闲鱼风控，未主动请求闲鱼接口',
+            'checked_at': checked_at,
+        }
+
+    except Exception as e:
+        return {
+            'cookie_id': cookie_id,
+            'valid': False,
+            'status': 'error',
+            'message': f'检查异常: {str(e)}',
+            'checked_at': checked_at,
+        }
+
+
+async def test_xianyu_cookie_connection_with_runtime(cookie_id: str, cookie_value: str) -> Dict[str, Any]:
+    """Prefer the already-running account connection and avoid active token probes."""
+    checked_at = int(time.time())
+    if cookie_manager.manager is not None:
+        runtime_status = cookie_manager.manager.get_runtime_connection_status(cookie_id)
+        if runtime_status:
+            return {
+                'cookie_id': cookie_id,
+                'valid': runtime_status.get('valid', False),
+                'status': runtime_status.get('status', 'error'),
+                'message': runtime_status.get('message', '运行态检查完成'),
+                'checked_at': checked_at,
+            }
+
+    return await test_xianyu_cookie_connection(cookie_id, cookie_value)
+
+
 class DefaultReplyIn(BaseModel):
     enabled: bool
     reply_content: Optional[str] = None
@@ -915,6 +975,39 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'auto_confirm': auto_confirm
         })
     return result
+
+
+@app.get("/cookies/connection-tests")
+async def test_all_cookie_connections(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """批量检查当前用户所有闲鱼账号连接状态。"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    user_id = current_user['user_id']
+    user_cookies = db_manager.get_all_cookies(user_id)
+    tasks = [
+        test_xianyu_cookie_connection_with_runtime(cookie_id, cookie_value)
+        for cookie_id, cookie_value in user_cookies.items()
+    ]
+    results = await asyncio.gather(*tasks) if tasks else []
+    return {
+        'checked_at': int(time.time()),
+        'results': results,
+    }
+
+
+@app.post("/cookies/{cid}/connection-test")
+async def test_cookie_connection(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动检查单个闲鱼账号连接状态。"""
+    if cookie_manager.manager is None:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    user_id = current_user['user_id']
+    user_cookies = db_manager.get_all_cookies(user_id)
+    if cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+    return await test_xianyu_cookie_connection_with_runtime(cid, user_cookies[cid])
 
 
 @app.post("/cookies")

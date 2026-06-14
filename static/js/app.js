@@ -14,6 +14,10 @@ let dashboardData = {
 let accountKeywordCache = {};
 let cacheTimestamp = 0;
 const CACHE_DURATION = 30000; // 30秒缓存
+let cookieConnectionStatusCache = {};
+let cookieConnectionCheckTimer = null;
+const COOKIE_CONNECTION_CHECK_INTERVAL = 600000; // 10分钟
+const COOKIE_CONNECTION_REQUEST_TIMEOUT = 15000; // 15秒请求超时
 
 // 菜单切换功能
 function showSection(sectionName) {
@@ -92,6 +96,10 @@ function showSection(sectionName) {
         button.textContent = '开启自动刷新';
         if (icon) icon.className = 'bi bi-play-circle me-1';
     }
+    }
+
+    if (sectionName !== 'accounts') {
+        stopCookieConnectionChecks();
     }
 }
 
@@ -981,6 +989,218 @@ async function fetchJSON(url, opts = {}) {
     }
 }
 
+function isAccountsSectionActive() {
+    const section = document.getElementById('accounts-section');
+    return section && section.classList.contains('active');
+}
+
+function formatCookieConnectionTime(timestamp) {
+    if (!timestamp) return '未检查';
+    const date = new Date(timestamp * 1000);
+    return date.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function getCookieConnectionState(status) {
+    if (!status) {
+        return {
+            badgeClass: 'bg-secondary',
+            icon: 'question-circle',
+            text: '未测试',
+            message: '尚未检查账号连接状态',
+            checkedAt: null
+        };
+    }
+
+    if (status.status === 'checking') {
+        const checkedAt = status.checked_at || 0;
+        const isStale = checkedAt && (Date.now() / 1000 - checkedAt > 60);
+        if (isStale) {
+            return {
+                badgeClass: 'bg-warning text-dark',
+                icon: 'exclamation-triangle-fill',
+                text: '异常',
+                message: '连接测试请求超时，请手动重试',
+                checkedAt: status.checked_at
+            };
+        }
+
+        return {
+            badgeClass: 'bg-info',
+            icon: 'arrow-repeat',
+            text: '测试中',
+            message: '正在检查账号连接状态',
+            checkedAt: status.checked_at
+        };
+    }
+
+    if (status.valid) {
+        return {
+            badgeClass: 'bg-success',
+            icon: 'check-circle-fill',
+            text: '有效',
+            message: status.message || '账号连接有效',
+            checkedAt: status.checked_at
+        };
+    }
+
+    if (status.status === 'invalid') {
+        return {
+            badgeClass: 'bg-danger',
+            icon: 'x-circle-fill',
+            text: '失效',
+            message: status.message || 'Cookie无效或已过期',
+            checkedAt: status.checked_at
+        };
+    }
+
+    return {
+        badgeClass: 'bg-warning text-dark',
+        icon: 'exclamation-triangle-fill',
+        text: '异常',
+        message: status.message || '无法确认连接状态',
+        checkedAt: status.checked_at
+    };
+}
+
+function renderCookieConnectionStatus(accountId) {
+    const status = cookieConnectionStatusCache[accountId];
+    const state = getCookieConnectionState(status);
+    const title = `${state.message}；检查时间：${formatCookieConnectionTime(state.checkedAt)}`;
+    return `
+        <div class="d-flex align-items-center gap-2 cookie-connection-status" data-cookie-id="${escapeHtml(accountId)}">
+            <span class="badge ${state.badgeClass}" title="${escapeHtml(title)}">
+                <i class="bi bi-${state.icon}"></i> ${state.text}
+            </span>
+            <button class="btn btn-sm btn-outline-secondary" data-cookie-id="${escapeHtml(accountId)}" onclick="checkCookieConnectionFromButton(this)" title="立即测试账号连接状态">
+                <i class="bi bi-lightning-charge"></i>
+            </button>
+        </div>
+        <small class="text-muted d-block mt-1">${formatCookieConnectionTime(state.checkedAt)}</small>
+    `;
+}
+
+function checkCookieConnectionFromButton(button) {
+    const accountId = button?.dataset?.cookieId;
+    if (accountId) {
+        checkCookieConnection(accountId, true);
+    }
+}
+
+function updateCookieConnectionCell(accountId) {
+    const cell = Array.from(document.querySelectorAll('.cookie-connection-cell'))
+        .find(element => element.dataset.cookieId === accountId);
+    if (cell) {
+        cell.innerHTML = renderCookieConnectionStatus(accountId);
+    }
+}
+
+async function requestCookieConnectionCheck(accountId) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), COOKIE_CONNECTION_REQUEST_TIMEOUT);
+
+    let res;
+    try {
+        res = await fetch(`${apiBase}/cookies/${encodeURIComponent(accountId)}/connection-test`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${authToken}` },
+            signal: controller.signal
+        });
+    } finally {
+        clearTimeout(timeoutId);
+    }
+
+    if (res.status === 401) {
+        localStorage.removeItem('auth_token');
+        window.location.href = '/';
+        return null;
+    }
+
+    if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(errorText || `HTTP ${res.status}`);
+    }
+
+    return await res.json();
+}
+
+async function checkCookieConnection(accountId, manual = false) {
+    try {
+        cookieConnectionStatusCache[accountId] = {
+            status: 'checking',
+            valid: false,
+            message: '正在检查账号连接状态',
+            checked_at: Math.floor(Date.now() / 1000)
+        };
+        updateCookieConnectionCell(accountId);
+
+        const result = await requestCookieConnectionCheck(accountId);
+        if (!result) return;
+
+        cookieConnectionStatusCache[accountId] = result;
+        updateCookieConnectionCell(accountId);
+
+        if (manual) {
+            showToast(`账号 "${accountId}" 连接测试：${result.valid ? '连接有效' : result.message}`, result.valid ? 'success' : 'warning');
+        }
+    } catch (err) {
+        const message = err.name === 'AbortError'
+            ? '连接测试超过15秒未返回，请稍后重试'
+            : (err.message || '检查失败');
+        cookieConnectionStatusCache[accountId] = {
+            status: 'error',
+            valid: false,
+            message,
+            checked_at: Math.floor(Date.now() / 1000)
+        };
+        updateCookieConnectionCell(accountId);
+        if (manual) {
+            showToast(`账号 "${accountId}" 连接测试失败`, 'danger');
+        }
+    }
+}
+
+async function checkAllCookieConnections() {
+    if (!isAccountsSectionActive()) return;
+
+    try {
+        const res = await fetch(`${apiBase}/cookies/connection-tests`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+
+        if (res.status === 401) {
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+
+        if (!res.ok) return;
+
+        const data = await res.json();
+        (data.results || []).forEach(result => {
+            cookieConnectionStatusCache[result.cookie_id] = result;
+            updateCookieConnectionCell(result.cookie_id);
+        });
+    } catch (err) {
+        console.warn('Cookie连接测试失败:', err);
+    }
+}
+
+function startCookieConnectionChecks() {
+    if (cookieConnectionCheckTimer) {
+        clearInterval(cookieConnectionCheckTimer);
+    }
+
+    checkAllCookieConnections();
+    cookieConnectionCheckTimer = setInterval(checkAllCookieConnections, COOKIE_CONNECTION_CHECK_INTERVAL);
+}
+
+function stopCookieConnectionChecks() {
+    if (cookieConnectionCheckTimer) {
+        clearInterval(cookieConnectionCheckTimer);
+        cookieConnectionCheckTimer = null;
+    }
+}
+
 // 加载Cookie列表
 async function loadCookies() {
     try {
@@ -993,7 +1213,7 @@ async function loadCookies() {
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
         <tr>
-            <td colspan="7" class="text-center py-4 text-muted empty-state">
+            <td colspan="9" class="text-center py-4 text-muted empty-state">
             <i class="bi bi-inbox fs-1 d-block mb-3"></i>
             <h5>暂无账号</h5>
             <p class="mb-0">请添加新的闲鱼账号开始使用</p>
@@ -1103,6 +1323,9 @@ async function loadCookies() {
             </span>
             </div>
         </td>
+        <td class="align-middle cookie-connection-cell" data-cookie-id="${escapeHtml(cookie.id)}">
+            ${renderCookieConnectionStatus(cookie.id)}
+        </td>
         <td class="align-middle">
             ${defaultReplyBadge}
         </td>
@@ -1157,6 +1380,8 @@ async function loadCookies() {
         }
         });
     });
+
+    startCookieConnectionChecks();
 
     } catch (err) {
     // 错误已在fetchJSON中处理

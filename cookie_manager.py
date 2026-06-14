@@ -1,6 +1,8 @@
 from __future__ import annotations
 import asyncio
-from typing import Dict, List, Tuple, Optional
+import contextlib
+import time
+from typing import Dict, List, Tuple, Optional, Any
 from loguru import logger
 from db_manager import db_manager
 
@@ -14,6 +16,8 @@ class CookieManager:
         self.loop = loop
         self.cookies: Dict[str, str] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.live_instances: Dict[str, Any] = {}
+        self.task_errors: Dict[str, str] = {}
         self.keywords: Dict[str, List[Tuple[str, str]]] = {}
         self.cookie_status: Dict[str, bool] = {}  # 账号启用状态
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
@@ -59,6 +63,8 @@ class CookieManager:
     async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
+        self.task_errors.pop(cookie_id, None)
+        live = None
 
         try:
             logger.info(f"【{cookie_id}】正在导入XianyuLive...")
@@ -68,14 +74,19 @@ class CookieManager:
             logger.info(f"【{cookie_id}】开始创建XianyuLive实例...")
             logger.info(f"【{cookie_id}】Cookie值长度: {len(cookie_value)}")
             live = XianyuLive(cookie_value, cookie_id=cookie_id, user_id=user_id)
+            self.live_instances[cookie_id] = live
             logger.info(f"【{cookie_id}】XianyuLive实例创建成功，开始调用main()...")
             await live.main()
         except asyncio.CancelledError:
             logger.info(f"XianyuLive 任务已取消: {cookie_id}")
         except Exception as e:
+            self.task_errors[cookie_id] = str(e) or repr(e)
             logger.error(f"XianyuLive 任务异常({cookie_id}): {e}")
             import traceback
             logger.error(f"详细错误信息: {traceback.format_exc()}")
+        finally:
+            if live is not None and self.live_instances.get(cookie_id) is live:
+                self.live_instances.pop(cookie_id, None)
 
     async def _add_cookie_async(self, cookie_id: str, cookie_value: str, user_id: int = None):
         if cookie_id in self.tasks:
@@ -100,6 +111,8 @@ class CookieManager:
         task = self.tasks.pop(cookie_id, None)
         if task:
             task.cancel()
+        self.live_instances.pop(cookie_id, None)
+        self.task_errors.pop(cookie_id, None)
         self.cookies.pop(cookie_id, None)
         self.keywords.pop(cookie_id, None)
         # 从数据库删除
@@ -160,6 +173,10 @@ class CookieManager:
             task = self.tasks.pop(cookie_id, None)
             if task:
                 task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            self.live_instances.pop(cookie_id, None)
+            self.task_errors.pop(cookie_id, None)
 
             # 更新Cookie值（保持原有user_id，不删除关键词）
             self.cookies[cookie_id] = new_value
@@ -274,9 +291,71 @@ class CookieManager:
                 task.cancel()
                 logger.info(f"已取消Cookie任务: {cookie_id}")
             del self.tasks[cookie_id]
+            self.live_instances.pop(cookie_id, None)
+            self.task_errors.pop(cookie_id, None)
             logger.info(f"成功停止Cookie任务: {cookie_id}")
         except Exception as e:
             logger.error(f"停止Cookie任务失败: {cookie_id}, {e}")
+
+    def get_runtime_connection_status(self, cookie_id: str) -> Optional[Dict[str, Any]]:
+        """Return live task health when an account is actively running."""
+        task = self.tasks.get(cookie_id)
+        live = self.live_instances.get(cookie_id)
+
+        if not task:
+            return None
+
+        if task.done():
+            error_message = self.task_errors.get(cookie_id)
+            if error_message:
+                return {
+                    'valid': False,
+                    'status': 'error',
+                    'message': f'账号运行任务异常：{error_message}',
+                }
+            return {
+                'valid': False,
+                'status': 'invalid',
+                'message': '账号运行任务已停止',
+            }
+
+        if not live:
+            return {
+                'valid': False,
+                'status': 'checking',
+                'message': '账号正在启动，尚未完成连接初始化',
+            }
+
+        now = time.time()
+        ws = getattr(live, 'ws', None)
+        ws_closed = bool(getattr(ws, 'closed', False)) if ws else True
+        last_token_error = getattr(live, 'last_token_error', '')
+        has_recent_token = bool(getattr(live, 'current_token', None)) and (
+            now - getattr(live, 'last_token_refresh_time', 0) < max(getattr(live, 'token_refresh_interval', 0) * 2, 600)
+        )
+        has_recent_heartbeat = bool(getattr(live, 'last_heartbeat_response', 0)) and (
+            now - getattr(live, 'last_heartbeat_response', 0) < max(getattr(live, 'heartbeat_interval', 0) * 3, 120)
+        )
+
+        if not ws_closed and (has_recent_token or has_recent_heartbeat):
+            return {
+                'valid': True,
+                'status': 'valid',
+                'message': '账号在线，运行中连接正常',
+            }
+
+        if not ws_closed:
+            return {
+                'valid': True,
+                'status': 'valid',
+                'message': 'WebSocket已连接，等待心跳或Token刷新确认',
+            }
+
+        return {
+            'valid': False,
+            'status': 'error',
+            'message': f'账号运行中，但WebSocket未连接；最近Token错误：{last_token_error}' if last_token_error else '账号运行中，但WebSocket未连接',
+        }
 
     def update_auto_confirm_setting(self, cookie_id: str, auto_confirm: bool):
         """实时更新账号的自动确认发货设置"""
@@ -299,4 +378,4 @@ class CookieManager:
 
 
 # 在 Start.py 中会把此变量赋值为具体实例
-manager: Optional[CookieManager] = None 
+manager: Optional[CookieManager] = None

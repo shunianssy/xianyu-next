@@ -4,6 +4,7 @@ import re
 import time
 import base64
 import os
+import socket
 from loguru import logger
 import websockets
 from utils.xianyu_utils import (
@@ -47,7 +48,10 @@ class XianyuLive:
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
         try:
-            return str(e)
+            error_text = str(e)
+            if error_text:
+                return error_text
+            return repr(e)
         except:
             try:
                 return repr(e)
@@ -78,7 +82,7 @@ class XianyuLive:
         self.myid = self.cookies['unb']
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
         self.device_id = generate_device_id(self.myid)
-        
+
         # 心跳相关配置
         self.heartbeat_interval = HEARTBEAT_INTERVAL
         self.heartbeat_timeout = HEARTBEAT_TIMEOUT
@@ -93,6 +97,8 @@ class XianyuLive:
         self.last_token_refresh_time = 0
         self.current_token = None
         self.token_refresh_task = None
+        self.last_token_error = ''
+        self.last_token_error_time = 0
         self.connection_restart_flag = False  # 连接重启标志
 
         # 通知防重复机制
@@ -109,6 +115,47 @@ class XianyuLive:
         
 
         self.session = None  # 用于API调用的aiohttp session
+
+    def _websocket_connect_kwargs(self):
+        """Use IPv4 for Goofish websocket; IPv6 DNS answers are slow/unreachable in some networks."""
+        return {
+            "family": socket.AF_INET,
+            "open_timeout": 30,
+        }
+
+    def _is_risk_control_error(self, error_text):
+        return any(
+            marker in (error_text or '')
+            for marker in ('FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR', '被挤爆啦')
+        )
+
+    def _is_success_response(self, res_json):
+        if not isinstance(res_json, dict):
+            return False
+        ret_value = res_json.get('ret', [])
+        return any('SUCCESS::调用成功' in ret for ret in ret_value)
+
+    def _extract_set_cookies(self, response):
+        new_cookies = {}
+        if 'set-cookie' not in response.headers:
+            return new_cookies
+
+        for cookie in response.headers.getall('set-cookie', []):
+            if '=' in cookie:
+                name, value = cookie.split(';')[0].split('=', 1)
+                new_cookies[name.strip()] = value.strip()
+        return new_cookies
+
+    async def _apply_response_cookies(self, response, persist=True):
+        new_cookies = self._extract_set_cookies(response)
+        if not new_cookies:
+            return
+
+        self.cookies.update(new_cookies)
+        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+        if persist:
+            await self.update_config_cookies()
+            logger.debug("已更新Cookie到数据库")
 
     def is_auto_confirm_enabled(self) -> bool:
         """检查当前账号是否启用自动确认发货"""
@@ -360,40 +407,33 @@ class XianyuLive:
                 ) as response:
                     res_json = await response.json()
                     
-                    # 检查并更新Cookie
-                    if 'set-cookie' in response.headers:
-                        new_cookies = {}
-                        for cookie in response.headers.getall('set-cookie', []):
-                            if '=' in cookie:
-                                name, value = cookie.split(';')[0].split('=', 1)
-                                new_cookies[name.strip()] = value.strip()
-                        
-                        # 更新cookies
-                        if new_cookies:
-                            self.cookies.update(new_cookies)
-                            # 生成新的cookie字符串
-                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                            # 更新数据库中的Cookie
-                            await self.update_config_cookies()
-                            logger.debug("已更新Cookie到数据库")
-                    
                     if isinstance(res_json, dict):
                         ret_value = res_json.get('ret', [])
                         # 检查ret是否包含成功信息
                         if any('SUCCESS::调用成功' in ret for ret in ret_value):
+                            await self._apply_response_cookies(response, persist=True)
                             if 'data' in res_json and 'accessToken' in res_json['data']:
                                 new_token = res_json['data']['accessToken']
                                 self.current_token = new_token
                                 self.last_token_refresh_time = time.time()
+                                self.last_token_error = ''
+                                self.last_token_error_time = 0
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
                                 return new_token
-                            
+
+                    if 'set-cookie' in response.headers:
+                        logger.warning(f"【{self.cookie_id}】Token刷新失败，跳过响应Set-Cookie持久化，避免覆盖手动更新的Cookie")
+
+                    self.last_token_error = str(res_json)
+                    self.last_token_error_time = time.time()
                     logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
                     # 发送Token刷新失败通知
                     await self.send_token_refresh_notification(f"Token刷新失败: {res_json}", "token_refresh_failed")
                     return None
 
         except Exception as e:
+            self.last_token_error = self._safe_str(e)
+            self.last_token_error_time = time.time()
             logger.error(f"Token刷新异常: {self._safe_str(e)}")
             # 发送Token刷新异常通知
             await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
@@ -760,34 +800,20 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-                    
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
-
                 logger.debug(f"商品信息获取成功: {res_json}")
                 # 检查返回状态
                 if isinstance(res_json, dict):
                     ret_value = res_json.get('ret', [])
                     # 检查ret是否包含成功信息
                     if not any('SUCCESS::调用成功' in ret for ret in ret_value):
+                        if 'set-cookie' in response.headers:
+                            logger.warning(f"【{self.cookie_id}】商品详情接口失败，跳过响应Set-Cookie持久化")
                         logger.warning(f"商品信息API调用失败，错误信息: {ret_value}")
                         
                         await asyncio.sleep(0.5)
                         return await self.get_item_info(item_id, retry_count + 1)
                     else:
+                        await self._apply_response_cookies(response, persist=True)
                         logger.debug(f"商品信息获取成功: {item_id}")
                         return res_json
                 else:
@@ -2330,7 +2356,8 @@ class XianyuLive:
         try:
             async with websockets.connect(
                 self.base_url,
-                extra_headers=headers
+                extra_headers=headers,
+                **self._websocket_connect_kwargs()
             ) as websocket:
                 await self._handle_websocket_connection(websocket, toid, item_id, text)
         except TypeError as e:
@@ -2342,7 +2369,8 @@ class XianyuLive:
                 # 使用兼容模式，通过subprotocols传递部分头信息
                 async with websockets.connect(
                     self.base_url,
-                    additional_headers=headers
+                    additional_headers=headers,
+                    **self._websocket_connect_kwargs()
                 ) as websocket:
                     await self._handle_websocket_connection(websocket, toid, item_id, text)
             else:
@@ -2360,7 +2388,8 @@ class XianyuLive:
             # 尝试使用extra_headers参数
             return websockets.connect(
                 self.base_url,
-                extra_headers=headers
+                extra_headers=headers,
+                **self._websocket_connect_kwargs()
             )
         except Exception as e:
             # 捕获所有异常类型，不仅仅是TypeError
@@ -2373,7 +2402,8 @@ class XianyuLive:
                 try:
                     return websockets.connect(
                         self.base_url,
-                        additional_headers=headers
+                        additional_headers=headers,
+                        **self._websocket_connect_kwargs()
                     )
                 except Exception as e2:
                     error_msg2 = self._safe_str(e2)
@@ -2382,7 +2412,7 @@ class XianyuLive:
                     if "additional_headers" in error_msg2 or "unexpected keyword argument" in error_msg2:
                         # 如果都不支持，则不传递headers
                         logger.warning("websockets库不支持headers参数，使用基础连接模式")
-                        return websockets.connect(self.base_url)
+                        return websockets.connect(self.base_url, **self._websocket_connect_kwargs())
                     else:
                         raise e2
             else:
@@ -2931,12 +2961,19 @@ class XianyuLive:
                                 continue
 
                 except Exception as e:
-                    logger.error(f"WebSocket连接异常: {self._safe_str(e)}")
+                    error_text = self._safe_str(e)
+                    logger.error(f"WebSocket连接异常: {error_text}")
                     if self.heartbeat_task:
                         self.heartbeat_task.cancel()
                     if self.token_refresh_task:
                         self.token_refresh_task.cancel()
-                    await asyncio.sleep(5)  # 等待5秒后重试
+                    token_error_text = getattr(self, 'last_token_error', '')
+                    if self._is_risk_control_error(error_text) or self._is_risk_control_error(token_error_text):
+                        wait_seconds = 600
+                        logger.warning(f"【{self.cookie_id}】疑似触发闲鱼风控，{wait_seconds // 60}分钟后再重试连接")
+                    else:
+                        wait_seconds = 5
+                    await asyncio.sleep(wait_seconds)
                     continue
         finally:
             await self.close_session()  # 确保关闭session
@@ -3021,27 +3058,11 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-                    
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
-
                 logger.info(f"商品信息获取响应: {res_json}")
 
                 # 检查响应是否成功
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                    await self._apply_response_cookies(response, persist=True)
                     items_data = res_json.get('data', {})
                     # 从cardList中提取商品信息
                     card_list = items_data.get('cardList', [])
@@ -3110,6 +3131,8 @@ class XianyuLive:
                         "raw_data": items_data  # 保留原始数据以备调试
                     }
                 else:
+                    if 'set-cookie' in response.headers:
+                        logger.warning(f"【{self.cookie_id}】商品列表接口失败，跳过响应Set-Cookie持久化")
                     # 检查是否是token失效
                     error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
                     if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():

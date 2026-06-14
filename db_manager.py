@@ -238,15 +238,6 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE keywords ADD COLUMN item_id TEXT")
                 logger.info("keywords 表 item_id 列添加完成")
 
-            # 检查并添加 require_confirm_delivery 列（用于买家确认收货后才发货功能）
-            try:
-                self._execute_sql(cursor, "SELECT require_confirm_delivery FROM item_info LIMIT 1")
-            except sqlite3.OperationalError:
-                # require_confirm_delivery 列不存在，需要添加
-                logger.info("正在为 item_info 表添加 require_confirm_delivery 列...")
-                self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN require_confirm_delivery BOOLEAN DEFAULT FALSE")
-                logger.info("item_info 表 require_confirm_delivery 列添加完成")
-
             # 创建商品信息表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS item_info (
@@ -259,12 +250,22 @@ class DBManager:
                 item_price TEXT,
                 item_detail TEXT,
                 is_multi_spec BOOLEAN DEFAULT FALSE,
+                require_confirm_delivery BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE,
                 UNIQUE(cookie_id, item_id)
             )
             ''')
+
+            # 检查并添加 require_confirm_delivery 列（用于买家确认收货后才发货功能）
+            try:
+                self._execute_sql(cursor, "SELECT require_confirm_delivery FROM item_info LIMIT 1")
+            except sqlite3.OperationalError:
+                # 旧库中 require_confirm_delivery 列不存在，需要添加
+                logger.info("正在为 item_info 表添加 require_confirm_delivery 列...")
+                self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN require_confirm_delivery BOOLEAN DEFAULT FALSE")
+                logger.info("item_info 表 require_confirm_delivery 列添加完成")
 
             # 创建自动发货规则表
             cursor.execute('''
@@ -935,6 +936,20 @@ class DBManager:
         if not self.sql_log_enabled:
             return
 
+        formatted_sql = ' '.join(sql.split())
+        sql_lower = formatted_sql.lower()
+
+        def should_mask_param(index: int, param) -> bool:
+            if not isinstance(param, str):
+                return False
+            if 'cookies' not in sql_lower or 'value' not in sql_lower:
+                return False
+            if sql_lower.startswith('insert') and index == 1:
+                return True
+            if sql_lower.startswith('update') and 'set value' in sql_lower and index == 0:
+                return True
+            return len(param) > 80 and ';' in param and '=' in param
+
         # 格式化参数
         params_str = ""
         if params:
@@ -942,15 +957,14 @@ class DBManager:
                 if len(params) > 0:
                     # 限制参数长度，避免日志过长
                     formatted_params = []
-                    for param in params:
-                        if isinstance(param, str) and len(param) > 100:
+                    for index, param in enumerate(params):
+                        if should_mask_param(index, param):
+                            formatted_params.append("'<redacted cookie>'")
+                        elif isinstance(param, str) and len(param) > 100:
                             formatted_params.append(f"{param[:100]}...")
                         else:
                             formatted_params.append(repr(param))
                     params_str = f" | 参数: [{', '.join(formatted_params)}]"
-
-        # 格式化SQL（移除多余空白）
-        formatted_sql = ' '.join(sql.split())
 
         # 根据配置的日志级别输出
         log_message = f"🗄️ SQL {operation}: {formatted_sql}{params_str}"
@@ -984,10 +998,11 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
+                self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
+                existing = cursor.fetchone()
+
                 # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
                 if user_id is None:
-                    self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
-                    existing = cursor.fetchone()
                     if existing:
                         user_id = existing[0]
                     else:
@@ -996,10 +1011,16 @@ class DBManager:
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
-                self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, cookie_value, user_id)
-                )
+                if existing:
+                    self._execute_sql(cursor,
+                        "UPDATE cookies SET value = ?, user_id = ? WHERE id = ?",
+                        (cookie_value, user_id, cookie_id)
+                    )
+                else:
+                    self._execute_sql(cursor,
+                        "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+                        (cookie_id, cookie_value, user_id)
+                    )
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
 

@@ -136,12 +136,12 @@
         <div id="usernameLoginForm" class="login-form-section">
           <div class="input-group">
             <i class="bi bi-person-fill"></i>
-            <input type="text" class="form-control" id="username" placeholder="请输入用户名">
+            <input type="text" class="form-control" id="username" placeholder="请输入用户名" value="admin">
           </div>
 
           <div class="input-group">
             <i class="bi bi-lock-fill"></i>
-            <input type="password" class="form-control" id="password" placeholder="请输入密码">
+            <input type="password" class="form-control" id="password" placeholder="请输入密码" value="admin">
           </div>
         </div>
 
@@ -234,7 +234,7 @@
           </div>
           <div class="d-flex justify-content-between align-items-center">
             <small class="text-muted">密码：</small>
-            <code class="bg-white px-2 py-1 rounded">admin123</code>
+            <code class="bg-white px-2 py-1 rounded">admin</code>
           </div>
         </div>
         <div class="text-center mt-2">
@@ -280,7 +280,7 @@
     // 填充默认登录凭据
     function fillDefaultCredentials() {
       document.getElementById('username').value = 'admin';
-      document.getElementById('password').value = 'admin123';
+      document.getElementById('password').value = 'admin';
       hideError();
 
       // 添加一个小动画效果
@@ -630,6 +630,8 @@
 
     // 事件监听器
     document.addEventListener('DOMContentLoaded', function() {
+      fillDefaultCredentials();
+
       // 登录方式切换
       document.querySelectorAll('input[name="loginType"]').forEach(radio => {
         radio.addEventListener('change', switchLoginType);
